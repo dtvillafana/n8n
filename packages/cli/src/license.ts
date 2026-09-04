@@ -2,7 +2,6 @@ import type { LicenseProvider } from '@n8n/backend-common';
 import { Logger } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
 import {
-	DEFAULT_WORKFLOW_HISTORY_PRUNE_LIMIT,
 	LICENSE_FEATURES,
 	LICENSE_QUOTAS,
 	Time,
@@ -278,7 +277,12 @@ export class License implements LicenseProvider {
 	}
 
 	isLicensed(feature: BooleanLicenseFeature) {
-		return this.manager?.hasFeatureEnabled(feature) ?? false;
+		const isEnabledInLicense = this.manager?.hasFeatureEnabled(feature) ?? false;
+
+		if (feature === LICENSE_FEATURES.API_DISABLED) return false;
+		if (feature === LICENSE_FEATURES.SHOW_NON_PROD_BANNER) return isEnabledInLicense;
+
+		return true;
 	}
 
 	isCertValid(): boolean {
@@ -447,17 +451,17 @@ export class License implements LicenseProvider {
 
 	/** @deprecated Use `LicenseState` instead. */
 	getUsersLimit() {
-		return this.getValue(LICENSE_QUOTAS.USERS_LIMIT) ?? UNLIMITED_LICENSE_QUOTA;
+		return UNLIMITED_LICENSE_QUOTA;
 	}
 
 	/** @deprecated Use `LicenseState` instead. */
 	getTriggerLimit() {
-		return this.getValue(LICENSE_QUOTAS.TRIGGER_LIMIT) ?? UNLIMITED_LICENSE_QUOTA;
+		return UNLIMITED_LICENSE_QUOTA;
 	}
 
 	/** @deprecated Use `LicenseState` instead. */
 	getVariablesLimit() {
-		return this.getValue(LICENSE_QUOTAS.VARIABLES_LIMIT) ?? UNLIMITED_LICENSE_QUOTA;
+		return UNLIMITED_LICENSE_QUOTA;
 	}
 
 	/** @deprecated Use `LicenseState` instead. */
@@ -467,15 +471,12 @@ export class License implements LicenseProvider {
 
 	/** @deprecated Use `LicenseState` instead. */
 	getWorkflowHistoryPruneLimit() {
-		return (
-			this.getValue(LICENSE_QUOTAS.WORKFLOW_HISTORY_PRUNE_LIMIT) ??
-			DEFAULT_WORKFLOW_HISTORY_PRUNE_LIMIT
-		);
+		return UNLIMITED_LICENSE_QUOTA;
 	}
 
 	/** @deprecated Use `LicenseState` instead. */
 	getTeamProjectLimit() {
-		return this.getValue(LICENSE_QUOTAS.TEAM_PROJECT_LIMIT) ?? 0;
+		return UNLIMITED_LICENSE_QUOTA;
 	}
 
 	getPlanName(): string {

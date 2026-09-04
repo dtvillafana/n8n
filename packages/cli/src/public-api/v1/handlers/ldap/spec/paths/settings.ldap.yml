@@ -30,8 +30,8 @@ put:
   description: >
     Replace the LDAP configuration with the provided full object (partial updates are
     not supported). For bindingAdminPassword, submit the blanking placeholder from a
-    prior GET to keep the stored password unchanged. Requires the `ldap:manage` scope 
-    and the LDAP feature to be licensed. Setting loginEnabled to false is destructive 
+    prior GET to keep the stored password unchanged. Requires the `ldap:manage` scope
+    and the LDAP feature to be licensed. Setting loginEnabled to false is destructive
     and it deletes all stored LDAP user identities and disables synchronization.
   requestBody:
     description: The full LDAP configuration to set.
