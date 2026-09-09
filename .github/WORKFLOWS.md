@@ -2,6 +2,18 @@
 
 Complete reference for n8n's `.github/` folder.
 
+## Nix Packaging
+
+`build-nix.yml` builds this fork on x86-64 and ARM64 Linux on pull requests,
+branch pushes, and n8n releases.
+
+`util-update-nix.yml` refreshes the pinned Nix inputs and pnpm hashes. It runs daily
+and after dependency changes on `master`. A separate job opens an update PR with
+a GitHub App token. Optional auto-merge uses the required branch checks.
+
+The package is defined in `flake.nix`. Run `nix build .#n8n` to build it.
+Update PRs use `NIX_UPDATE_APP_ID` and `NIX_UPDATE_APP_PRIVATE_KEY`.
+
 ---
 
 ## Folder Structure

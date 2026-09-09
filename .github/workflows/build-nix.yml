@@ -1,0 +1,61 @@
+name: 'Build: Nix'
+
+on:
+  pull_request:
+  push:
+    branches: [master, 'release/**']
+    tags: ['n8n@*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'n8n@')
+    name: Nix (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+
+      - name: Free space on the hosted runner
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 1
+            cores = 2
+
+      - name: Check Nix formatting
+        run: nix fmt -- --check flake.nix
+
+      - name: Build package
+        run: nix build .#n8n --print-build-logs > nix-build.log 2>&1
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nix-logs-${{ matrix.system }}
+          path: nix-*.log
+          retention-days: 14

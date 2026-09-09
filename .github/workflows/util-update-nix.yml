@@ -1,0 +1,114 @@
+name: 'Util: Update Nix'
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  push:
+    branches: [master]
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - 'patches/**'
+      - '**/package.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: >-
+      github.repository == 'dtvillafana/n8n' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+
+      - name: Update pinned inputs
+        run: nix flake update
+
+      - name: Refresh dependency hashes
+        run: |
+          nix shell --inputs-from . nixpkgs#nix-update -c nix-update --flake --override-filename flake.nix --version=skip n8n > nix-update.log 2>&1
+          nix fmt -- flake.nix
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nix-update
+          path: |
+            flake.lock
+            flake.nix
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload update log
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nix-update-log
+          path: nix-update.log
+          retention-days: 14
+
+  pull-request:
+    needs: update
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nix-update
+          path: updated
+
+      - name: Copy allowed update files
+        run: |
+          cp updated/flake.lock flake.lock
+          cp updated/flake.nix flake.nix
+
+      # An App token lets the update PR trigger the normal build workflow.
+      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        id: app
+        with:
+          app-id: ${{ vars.NIX_UPDATE_APP_ID }}
+          private-key: ${{ secrets.NIX_UPDATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        id: pr
+        with:
+          token: ${{ steps.app.outputs.token }}
+          base: ${{ github.event.repository.default_branch }}
+          branch: automation/nix-update
+          delete-branch: true
+          add-paths: |
+            flake.lock
+            flake.nix
+          title: 'chore: Update Nix dependencies'
+          commit-message: 'chore: Update Nix dependencies'
+          body: |
+            Update the pinned Nix inputs and pnpm dependency hashes.
+
+            The Nix build workflow builds both Linux architectures.
+            Merge only after both Nix checks pass.
+
+      - name: Enable optional auto-merge
+        if: vars.NIX_AUTO_MERGE == 'true' && steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --auto --squash
