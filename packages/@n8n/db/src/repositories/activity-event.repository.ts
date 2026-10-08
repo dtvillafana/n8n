@@ -4,6 +4,7 @@ import type { FindOperator, FindOptionsWhere } from '@n8n/typeorm';
 import type { IDataObject } from 'n8n-workflow';
 
 import { ActivityEvent } from '../entities';
+import type { ActivityResourceType } from '../entities';
 
 /** Long enough for any name a list needs to show, short enough that a row stays a pointer. */
 export const activityResourceNameMaxLength = 128;
@@ -31,6 +32,19 @@ export type ActivityEventInput = Pick<ActivityEvent, 'category' | 'action' | 'pr
 		data?: IDataObject | null;
 	};
 
+/**
+ * The projects whose entries a caller may see.
+ *
+ * A list, or the explicit `'all-projects'` for a reader whose scope is genuinely the whole
+ * instance. Spelling that case out beats enumerating every project id and binding them: a global
+ * reader on a large estate would otherwise bind one parameter per project — one exists per user —
+ * which crosses sqlite's ceiling and pushes Postgres off the `(projectId, id)` index.
+ *
+ * It is a literal rather than an optional field on purpose. An omitted scope reading everything is
+ * the failure this type exists to prevent, so the widest scope has to be asked for by name.
+ */
+export type ActivityProjectScope = string[] | 'all-projects';
+
 export type ActivityFeedQuery = {
 	limit: number;
 	/**
@@ -38,10 +52,13 @@ export type ActivityFeedQuery = {
 	 * would read every project on the instance, including ones the user cannot open. Entries
 	 * with no project are excluded, since there is no way to prove they are in scope.
 	 */
-	projectIds: string[];
+	projectIds: ActivityProjectScope;
 	userId?: string;
 	resourceId?: string;
-	category?: ActivityEvent['category'];
+	/** Optional category filter. It must be in `allowedCategories`. */
+	filterCategory?: ActivityEvent['category'];
+	/** The categories the caller has permission to read. */
+	allowedCategories: Array<ActivityEvent['category']>;
 	/**
 	 * Exclusive lower bound — entries newer than an id a caller has already seen. Ids are not a
 	 * completeness watermark; see `ActivityEvent.id` before using this to tail the feed.
@@ -50,6 +67,16 @@ export type ActivityFeedQuery = {
 	/** Exclusive upper bound, for paging backwards through older entries. */
 	beforeId?: number;
 };
+
+/** Nothing in scope means nothing is visible, which is not the same as no filter. */
+function isEmptyScope(scope: ActivityProjectScope): boolean {
+	return scope !== 'all-projects' && scope.length === 0;
+}
+
+/** No project predicate at all for a whole-instance reader, so the scope costs no bind parameters. */
+function projectScopeWhere(scope: ActivityProjectScope): FindOptionsWhere<ActivityEvent> {
+	return scope === 'all-projects' ? {} : { projectId: In(scope) };
+}
 
 @Service()
 export class ActivityEventRepository extends Repository<ActivityEvent> {
@@ -84,14 +111,20 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 	 */
 	async findFeed(query: ActivityFeedQuery): Promise<ActivityEvent[]> {
 		if (isEmptyPage(query.limit)) return [];
-		// An empty allowance means nothing is visible, not everything — `In([])` would match no
-		// row on Postgres but is worth being explicit about rather than relying on it.
-		if (query.projectIds.length === 0) return [];
+		// Empty project or category permissions must not widen the query.
+		if (isEmptyScope(query.projectIds) || query.allowedCategories.length === 0) return [];
+		if (
+			query.filterCategory !== undefined &&
+			!query.allowedCategories.includes(query.filterCategory)
+		)
+			return [];
 
-		const where: FindOptionsWhere<ActivityEvent> = { projectId: In(query.projectIds) };
+		const where: FindOptionsWhere<ActivityEvent> = {
+			...projectScopeWhere(query.projectIds),
+			category: query.filterCategory ?? In(query.allowedCategories),
+		};
 		if (query.userId !== undefined) where.userId = query.userId;
 		if (query.resourceId !== undefined) where.resourceId = query.resourceId;
-		if (query.category !== undefined) where.category = query.category;
 
 		// Both bounds can apply at once — "what arrived while this page was open" pages an
 		// already-bounded range — so they combine rather than overwrite each other.
@@ -105,9 +138,52 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 		return await this.find({ where, order: { id: 'DESC' }, take: query.limit });
 	}
 
+	/**
+	 * One entry by id, or null when it is not in scope — which is also what a pruned id returns.
+	 * The two are deliberately indistinguishable: an id is a guess a reader may get wrong, and a
+	 * distinct "exists but not yours" would turn this into a probe for what other projects hold.
+	 *
+	 * Scoped here rather than by the caller, so the guarantee holds for every future caller.
+	 */
+	async findEntry(query: {
+		id: number;
+		projectIds: ActivityProjectScope;
+		allowedCategories: Array<ActivityEvent['category']>;
+	}): Promise<ActivityEvent | null> {
+		if (isEmptyScope(query.projectIds) || query.allowedCategories.length === 0) return null;
+
+		return await this.findOne({
+			where: {
+				id: query.id,
+				...projectScopeWhere(query.projectIds),
+				category: In(query.allowedCategories),
+			},
+		});
+	}
+
+	async findByResource(query: {
+		resourceType: ActivityResourceType;
+		resourceId: string;
+		projectIds: ActivityProjectScope;
+		limit: number;
+	}): Promise<ActivityEvent[]> {
+		if (isEmptyPage(query.limit)) return [];
+		if (isEmptyScope(query.projectIds)) return [];
+
+		return await this.find({
+			where: {
+				resourceType: query.resourceType,
+				resourceId: query.resourceId,
+				...projectScopeWhere(query.projectIds),
+			},
+			order: { id: 'DESC' },
+			take: query.limit,
+		});
+	}
+
 	/** Retention by age. Returns how many entries went, so a caller can log a sweep worth noticing. */
-	async deleteOlderThan(cutoff: Date): Promise<number> {
-		return await this.deleteInBatches({ createdAt: LessThan(cutoff) });
+	async deleteOlderThan(cutoff: Date, signal?: AbortSignal): Promise<number> {
+		return await this.deleteInBatches({ createdAt: LessThan(cutoff) }, undefined, signal);
 	}
 
 	/**
@@ -115,7 +191,7 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 	 * more in a day than the window is meant to hold. Finds the oldest entry worth keeping and
 	 * deletes below it, rather than counting rows twice.
 	 */
-	async deleteBeyondNewest(keep: number): Promise<number> {
+	async deleteBeyondNewest(keep: number, signal?: AbortSignal): Promise<number> {
 		// A cap of 0 means unlimited, as it does for `EXECUTIONS_DATA_PRUNE_MAX_COUNT`. Reading it
 		// as "keep nothing" would empty the table on a config typo. Also guards `skip: keep - 1`,
 		// which would otherwise ask the driver for a negative offset.
@@ -129,7 +205,7 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 		});
 		if (!oldestKept) return 0;
 
-		return await this.deleteInBatches({}, LessThan(oldestKept.id));
+		return await this.deleteInBatches({}, LessThan(oldestKept.id), signal);
 	}
 
 	/**
@@ -143,10 +219,14 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 	 *
 	 * `idBound` is taken apart from `scope` so the per-batch bound can be *added* to it rather
 	 * than replacing it. A caller cannot hand over a batch predicate that drops its own scope.
+	 *
+	 * `signal` stops the walk at a batch boundary. Without it a long backlog holds its caller for
+	 * as many round trips as it takes, which on a sweeper means blocking shutdown and stepdown.
 	 */
 	private async deleteInBatches(
 		scope: Omit<FindOptionsWhere<ActivityEvent>, 'id'>,
 		idBound?: FindOperator<number>,
+		signal?: AbortSignal,
 	): Promise<number> {
 		const scoped: FindOptionsWhere<ActivityEvent> = idBound ? { ...scope, id: idBound } : scope;
 		let total = 0;
@@ -168,6 +248,9 @@ export class ActivityEventRepository extends Repository<ActivityEvent> {
 			total += affected ?? 0;
 
 			if (batch.length < retentionBatchSize) return total;
+			// Checked between passes, so a caller that has to stop — a shutdown, or a leader losing
+			// the role — waits for one bounded delete rather than the whole backlog.
+			if (signal?.aborted) return total;
 		}
 	}
 }

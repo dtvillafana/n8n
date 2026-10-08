@@ -1,7 +1,7 @@
 import { LicenseState } from '@n8n/backend-common';
 import { Service } from '@n8n/di';
 
-import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+import { ForbiddenError } from '@n8n/errors';
 
 import type { CredentialBindingRequest } from '../entities/credential/credential.types';
 import { removesUnpackagedWorkflows } from '../entities/folder/folder-conflict-policy';
@@ -19,13 +19,18 @@ import type {
 	ImportBindingMap,
 	ImportedFolderSummary,
 	ImportedWorkflowSummary,
+	ImportSelection,
 	ResolvedImportRequest,
 	ImportTagSummary,
 	PackageImportBindings,
 	PackageImportSource,
 } from '../n8n-packages.types';
 import { mergeBindings } from '../n8n-packages.types';
-import { assertPackageImportApiKeyScopes, assertTagWritesAllowed } from './import-gates';
+import {
+	assertArchiveTransitionsAllowed,
+	assertPackageImportApiKeyScopes,
+	assertTagWritesAllowed,
+} from './import-gates';
 import { toImportBlockedError } from './import-blocked.error';
 import { needsBundledVariableValues, placeByLayout } from './package-layout';
 import {
@@ -67,7 +72,15 @@ export class ProjectPackageImporter {
 	): Promise<ImportOutcome> {
 		this.assertAdequatePermissions(request, manifest);
 
-		const projects = await this.packageParser.getProjects(reader);
+		const { selection } = request;
+		const selectedProjects = selection
+			? (manifest.projects ?? []).filter((project) => project.id === selection.selectedProjectId)
+			: (manifest.projects ?? []);
+
+		const allProjects = await this.packageParser.getProjects(reader);
+		const projects = selection
+			? allProjects.filter((project) => project.sourceProjectId === selection.selectedProjectId)
+			: allProjects;
 		const projectPlan = await this.projectImporter.plan(
 			request.user,
 			projects,
@@ -100,7 +113,7 @@ export class ProjectPackageImporter {
 		// Plan and validate every project's contents before writing anything, so a blocking issue in
 		// any project leaves nothing behind — not folders, workflows, nor the project shells.
 		const planned: Array<{ project: ManifestEntry; plan: ImportPlan }> = [];
-		for (const project of manifest.projects ?? []) {
+		for (const project of selectedProjects) {
 			const input = await this.buildImportContextForProject(
 				request,
 				reader,
@@ -117,6 +130,10 @@ export class ProjectPackageImporter {
 		assertTagWritesAllowed(
 			request.apiKeyScopes,
 			planned.map(({ plan }) => plan.tagPlan),
+		);
+		assertArchiveTransitionsAllowed(
+			request.apiKeyScopes,
+			planned.map(({ plan }) => plan.workflowPlan),
 		);
 		await this.importOrchestrator.assertNotBlocked(
 			planned.map(({ plan }) => plan),
@@ -165,6 +182,7 @@ export class ProjectPackageImporter {
 		const stubbed: string[] = [];
 		let dataTablesMatched = 0;
 		let dataTablesCreated = 0;
+		let dataTablesUpdated = 0;
 		const variablesMatched: string[] = [];
 		const variablesMissing: string[] = [];
 		const variablesCreated: string[] = [];
@@ -186,6 +204,7 @@ export class ProjectPackageImporter {
 			stubbed.push(...content.credentialResult.stubbed);
 			dataTablesMatched += content.dataTablePlan.matchedCount;
 			dataTablesCreated += content.dataTablePlan.creations.length;
+			dataTablesUpdated += content.dataTablePlan.updates.length;
 			variablesMatched.push(...content.variablePlan.matched);
 			variablesMissing.push(...content.variablePlan.missing.map(({ name }) => name));
 			variablesCreated.push(...content.variableResult.created);
@@ -212,7 +231,11 @@ export class ProjectPackageImporter {
 			projects: projectSummaries,
 			bindings: mergeBindings(...scopedBindings),
 			credentials: { matched, stubbed },
-			dataTables: { matched: dataTablesMatched, created: dataTablesCreated },
+			dataTables: {
+				matched: dataTablesMatched,
+				created: dataTablesCreated,
+				updated: dataTablesUpdated,
+			},
 			variables: reconcileVariableSummary({
 				matched: variablesMatched,
 				missing: variablesMissing,
@@ -238,7 +261,14 @@ export class ProjectPackageImporter {
 	): Promise<ImportOrchestrationInput> {
 		const basePrefix = `${project.target}/`;
 		const folders = await this.packageParser.getFolders(reader, basePrefix);
-		const workflows = await this.packageParser.getWorkflows(reader, basePrefix);
+		const allWorkflows = await this.packageParser.getWorkflows(reader, basePrefix);
+
+		// Do not expand the selection to include referenced sub-workflows.
+		const workflows = request.selection
+			? allWorkflows.filter((workflow) =>
+					request.selection!.selectedWorkflowIds.includes(workflow.sourceWorkflowId),
+				)
+			: allWorkflows;
 
 		// Requirements and bindings are both scoped to this project's workflows so another project's
 		// binding is not seen as an orphan here (which would block the whole multi-project import).
@@ -298,6 +328,7 @@ export class ProjectPackageImporter {
 			// Scoped like the requirements above: reconciliation must retain a referenced-but-not-carried
 			// sub-workflow, or it would archive a dependency and leave its packaged parent unpublishable.
 			subWorkflowRequirements: identifyRequirements(manifest.requirements?.workflows, workflows),
+			explicitDeleteWorkflowIds: deletesForProject(request.selection, project.id),
 		};
 	}
 
@@ -328,5 +359,18 @@ export class ProjectPackageImporter {
 			// Folders it empties go too, so it needs both removal scopes up front.
 			assertPackageImportApiKeyScopes(request.apiKeyScopes, ['workflow:delete', 'folder:delete']);
 		}
+
+		// Selection imports preserve folders, so explicit deletions need only workflow:delete.
+		if (request.selection?.deletedWorkflowIds?.length) {
+			assertPackageImportApiKeyScopes(request.apiKeyScopes, ['workflow:delete']);
+		}
 	}
+}
+
+function deletesForProject(
+	selection: ImportSelection | undefined,
+	projectId: string,
+): string[] | undefined {
+	if (!selection || selection.selectedProjectId !== projectId) return undefined;
+	return selection.deletedWorkflowIds;
 }

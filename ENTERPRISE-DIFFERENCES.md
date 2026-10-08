@@ -13,6 +13,13 @@ This build does not use license entitlements to restrict locally available featu
 - Operator configuration, environment feature flags, permissions, authentication policy, and required external service configuration continue to apply.
 - Evaluation concurrency remains controlled by operator configuration and existing runtime defaults because it is an execution-capacity safeguard, not a feature-access gate.
 
+## Upstream Sync
+
+- Upstream `master` was merged at `ce1be847c8`.
+- New Worker Pools, SCIM, type-availability policies, and AI Assistant cloud entitlement checks use the shared Boolean feature override.
+- No new license quota keys were added in this sync.
+- The LDAP Public API uses the upstream controller and OpenAPI schema. The old handler schema was removed upstream.
+
 ## Feature Implementation Changes
 
 No enterprise feature implementation was changed. Ungating is confined to the shared license availability and license-derived capacity boundaries.

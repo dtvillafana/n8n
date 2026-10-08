@@ -12,7 +12,8 @@ export * from './uuid';
 export const LICENSE_FEATURES = {
 	SHARING: 'feat:sharing',
 	LDAP: 'feat:ldap',
-	NODE_TYPE_POLICIES: 'feat:nodeTypePolicies',
+	SCIM: 'feat:scim',
+	TYPE_AVAILABILITY_POLICIES: 'feat:typeAvailabilityPolicies',
 	SAML: 'feat:saml',
 	OIDC: 'feat:oidc',
 	MFA_ENFORCEMENT: 'feat:mfaEnforcement',
@@ -41,6 +42,7 @@ export const LICENSE_FEATURES = {
 	AI_CREDITS: 'feat:aiCredits',
 	AI_GATEWAY: 'feat:aiGateway',
 	AI_GATEWAY_CLOUD_UBB: 'feat:aiGatewayCloudUbb',
+	AI_ASSISTANT_CLOUD_UBB_ENTITLEMENT: 'feat:aiAssistantCloudUbbEntitlement',
 	FOLDERS: 'feat:folders',
 	INSIGHTS_VIEW_SUMMARY: 'feat:insights:viewSummary',
 	INSIGHTS_VIEW_DASHBOARD: 'feat:insights:viewDashboard',
@@ -56,6 +58,7 @@ export const LICENSE_FEATURES = {
 	DATA_REDACTION: 'feat:dataRedaction',
 	OTEL_CUSTOM_SPAN_ATTRIBUTES: 'feat:otel:customSpanAttributes',
 	WORKFLOW_REVIEWS: 'feat:workflowReviews',
+	WORKER_POOLS: 'feat:workerPools',
 } as const;
 
 export const LICENSE_QUOTAS = {

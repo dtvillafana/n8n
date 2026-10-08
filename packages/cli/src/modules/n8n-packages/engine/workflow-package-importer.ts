@@ -4,8 +4,7 @@ import { Service } from '@n8n/di';
 import type { Scope } from '@n8n/permissions';
 import { UserError } from 'n8n-workflow';
 
-import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
-import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { ForbiddenError, NotFoundError } from '@n8n/errors';
 import { FolderService } from '@/services/folder.service';
 import { ProjectService } from '@/services/project.service.ee';
 
@@ -17,7 +16,11 @@ import { WorkflowPublisher } from '../entities/workflow/workflow-publisher';
 import type { PackageReader } from '../io/package-reader';
 import { VariableParentPolicy } from '../n8n-packages.types';
 import type { ImportContext, ResolvedImportRequest } from '../n8n-packages.types';
-import { assertPackageImportApiKeyScopes, assertTagWritesAllowed } from './import-gates';
+import {
+	assertArchiveTransitionsAllowed,
+	assertPackageImportApiKeyScopes,
+	assertTagWritesAllowed,
+} from './import-gates';
 import { ImportOrchestrator } from './import-orchestrator';
 import {
 	buildImportResult,
@@ -125,6 +128,7 @@ export class WorkflowPackageImporter {
 		});
 
 		assertTagWritesAllowed(request.apiKeyScopes, [plan.tagPlan]);
+		assertArchiveTransitionsAllowed(request.apiKeyScopes, [plan.workflowPlan]);
 		await this.importOrchestrator.assertNotBlocked([plan], { apiKeyScopes: request.apiKeyScopes });
 
 		const content = await this.importOrchestrator.apply(plan);
@@ -169,6 +173,7 @@ export class WorkflowPackageImporter {
 			dataTables: {
 				matched: content.dataTablePlan.matchedCount,
 				created: content.dataTablePlan.creations.length,
+				updated: content.dataTablePlan.updates.length,
 			},
 			variables: toVariableSummary(content.variablePlan, content.variableResult),
 			tags: toTagSummary(content.tagPlan),

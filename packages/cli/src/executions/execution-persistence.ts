@@ -1,4 +1,5 @@
 import { parseFlatted } from '@n8n/backend-common';
+import { EventService } from '@n8n/backend-services';
 import { DatabaseConfig, ExecutionsConfig } from '@n8n/config';
 import { Time } from '@n8n/constants';
 import type {
@@ -35,12 +36,11 @@ import {
 	type BundleWorkflowSnapshot,
 	type ExecutionDataPayload,
 	type ExecutionRef,
-	type WorkflowSnapshot,
+	toWorkflowSnapshot,
 } from './execution-data/types';
 import { UnreadableRunDataError } from './execution-data/unreadable-run-data.error';
 import { sumBinaryDataBytes } from './sum-binary-data-bytes';
 import { DuplicateExecutionError } from '../errors/duplicate-execution.error';
-import { EventService } from '../events/event.service';
 
 type DeletionTarget = ExecutionRef & { storedAt: ExecutionDataStorageLocation };
 
@@ -98,15 +98,8 @@ export class ExecutionPersistence {
 	 */
 	async create(payload: CreateExecutionPayload, ctx: OperationContext = {}): Promise<string> {
 		const { data: rawData, workflowData, ...rest } = payload;
-		const { connections, nodes, name, settings, id, nodeGroups } = workflowData;
-		const workflowSnapshot: WorkflowSnapshot = {
-			connections,
-			nodes,
-			name,
-			settings,
-			id,
-			nodeGroups,
-		};
+		const { id } = workflowData;
+		const workflowSnapshot = toWorkflowSnapshot(workflowData);
 		const storedAt = this.storageConfig.modeTag;
 		const workflowVersionId = workflowData.versionId ?? null;
 		const executionEntity = { ...rest, createdAt: new Date(), storedAt, workflowVersionId };
@@ -594,6 +587,11 @@ export class ExecutionPersistence {
 		});
 	}
 
+	/** Statuses of the given executions in one read; ids that no longer exist are absent. */
+	async findStatusesByIds(ids: string[]): Promise<Array<{ id: string; status: ExecutionStatus }>> {
+		return await this.executionRepository.findStatusesByIds(ids);
+	}
+
 	/** Find executions scoped to the given workflows, with data per `storedAt`. */
 	async findManyInWorkflows(
 		workflowIds: string[],
@@ -811,7 +809,7 @@ export class ExecutionPersistence {
 				const jsonSizeBytes = await this.trackWrite(mode, ref.workflowId, async () => {
 					const bundle: ExecutionDataPayload = {
 						data: stringify(data),
-						workflowData: this.toWorkflowSnapshot(workflowData),
+						workflowData: toWorkflowSnapshot(workflowData),
 						workflowVersionId,
 					};
 
@@ -851,7 +849,7 @@ export class ExecutionPersistence {
 
 				const bundle: ExecutionDataPayload = {
 					data: serializedData,
-					workflowData: workflowData ? this.toWorkflowSnapshot(workflowData) : stored.workflowData,
+					workflowData: workflowData ? toWorkflowSnapshot(workflowData) : stored.workflowData,
 					workflowVersionId: stored.workflowVersionId,
 				};
 
@@ -917,6 +915,7 @@ export class ExecutionPersistence {
 		// TODO(CAT-3214): `ExecutionEntity.finished` is deprecated and we should rely on statuses
 		// only, but for now we still use it to filter out finished executions for parity with
 		// ExecutionRepository.
+		// oxlint-disable-next-line typescript/no-deprecated
 		if (conditions?.requireNotFinished) where.finished = false;
 		if (conditions?.requireNotCanceled) where.status = Not('canceled');
 		return where;
@@ -992,13 +991,6 @@ export class ExecutionPersistence {
 		if (mode !== 'db') return await this.jsonStore.read(ref, mode);
 
 		return tx ? await this.dbStore.read(ref, tx) : await this.dbStore.read(ref);
-	}
-
-	private toWorkflowSnapshot(
-		workflowData: NonNullable<IExecutionResponse['workflowData']>,
-	): WorkflowSnapshot {
-		const { id, name, nodes, connections, settings, nodeGroups } = workflowData;
-		return { id, name, nodes, connections, settings, nodeGroups };
 	}
 
 	private async assembleExecution(

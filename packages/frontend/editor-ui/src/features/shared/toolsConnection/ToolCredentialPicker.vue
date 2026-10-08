@@ -37,6 +37,12 @@ const isOpen = ref(false);
 const searchQuery = ref('');
 const searchInputRef = ref<InstanceType<typeof N8nInput> | null>(null);
 
+function open(): void {
+	if (props.item.status !== 'connecting') isOpen.value = true;
+}
+
+defineExpose({ open });
+
 const selectedCredentialIds = computed(() =>
 	props.credentials.map((c) => c.credentialId).filter((id): id is string => Boolean(id)),
 );
@@ -48,17 +54,27 @@ const availableCredentials = computed(() => {
 			id: c.id,
 			name: c.name,
 			authType: cred.authType,
+			authDisplayName: cred.displayName,
 		})),
 	);
 });
 
+const selectedCredentialName = computed(() => {
+	for (const credentialRef of props.credentials) {
+		if (!credentialRef.credentialId) continue;
+		const credential = adapter
+			?.getCredentialsByType(credentialRef.authType)
+			.find(({ id }) => id === credentialRef.credentialId);
+		if (credential) return credential.name;
+	}
+	return undefined;
+});
+
 const statusLabel = computed(() => {
-	if (props.item.status === 'connected') {
-		return i18n.baseText('tools.connection.action.connected');
-	}
-	if (props.item.status === 'disconnected') {
+	if (selectedCredentialName.value) return selectedCredentialName.value;
+	if (props.item.status === 'connected') return i18n.baseText('tools.connection.action.connected');
+	if (props.item.status === 'disconnected')
 		return i18n.baseText('tools.connection.action.reconnect');
-	}
 	return '';
 });
 
@@ -85,18 +101,26 @@ function pickCredential(authType: string, credentialId: string) {
 	isOpen.value = false;
 }
 
-const createAuthType = computed(
-	() => props.credentials.find((c) => c.required)?.authType ?? props.credentials[0]?.authType,
+const creatableCredentials = computed(() =>
+	props.credentials.filter(
+		(credential, index, credentials) =>
+			credentials.findIndex(({ authType }) => authType === credential.authType) === index,
+	),
 );
 
-function createCredential(source: 'direct' | 'dropdown') {
-	if (!createAuthType.value) return;
+function createCredential(authType: string, source: 'direct' | 'dropdown') {
+	if (!authType) return;
 	if (source === 'direct') {
 		emit('first-credential-connect', props.item);
 	} else {
 		emit('new-credential-connect', props.item);
 	}
-	adapter?.openNewCredential(createAuthType.value, props.item);
+	const credentialTypes =
+		creatableCredentials.value.length > 1
+			? creatableCredentials.value.map((credential) => credential.authType)
+			: undefined;
+
+	adapter?.openNewCredential(authType, props.item, credentialTypes);
 	isOpen.value = false;
 }
 
@@ -116,7 +140,11 @@ function editCredential(credentialId: string) {
 		{{ i18n.baseText('tools.connection.action.connecting') }}
 	</span>
 	<N8nPopover
-		v-else-if="hasToolConnection(item.status) || availableCredentials.length > 0"
+		v-else-if="
+			hasToolConnection(item.status) ||
+			availableCredentials.length > 0 ||
+			creatableCredentials.length > 1
+		"
 		v-model:open="isOpen"
 		side="bottom"
 		align="end"
@@ -131,15 +159,16 @@ function editCredential(credentialId: string) {
 				v-if="item.status === 'disconnected'"
 				variant="outline"
 				size="small"
+				:class="$style.disconnectedTrigger"
 				data-test-id="tool-credential-picker-trigger-disconnected"
 			>
 				<N8nIcon
 					icon="circle-x"
-					:size="14"
+					:size="16"
 					:class="$style.statusIconDisconnected"
 					aria-hidden="true"
 				/>
-				<span>{{ statusLabel }}</span>
+				<span :class="$style.statusLabel" :title="statusLabel">{{ statusLabel }}</span>
 				<N8nIcon icon="chevron-down" :size="12" />
 			</N8nButton>
 			<button
@@ -148,8 +177,8 @@ function editCredential(credentialId: string) {
 				:class="$style.statusPill"
 				:data-test-id="`tool-credential-picker-trigger-${item.status}`"
 			>
-				<N8nIcon icon="check" :size="14" :class="$style.statusIconConnected" aria-hidden="true" />
-				<span>{{ statusLabel }}</span>
+				<N8nIcon icon="check" :size="12" :class="$style.statusIconConnected" aria-hidden="true" />
+				<span :class="$style.statusLabel" :title="statusLabel">{{ statusLabel }}</span>
 				<N8nIcon icon="chevron-down" :size="12" />
 			</button>
 			<N8nButton
@@ -193,7 +222,15 @@ function editCredential(credentialId: string) {
 					:data-auth-type="cred.authType"
 					@click="pickCredential(cred.authType, cred.id)"
 				>
-					<span :class="$style.rowLabel">{{ cred.name }}</span>
+					<span :class="$style.rowLabel">
+						{{ cred.name }}
+						<small
+							v-if="creatableCredentials.length > 1 && cred.authDisplayName"
+							:class="$style.authLabel"
+						>
+							{{ cred.authDisplayName }}
+						</small>
+					</span>
 					<span :class="$style.rowActions">
 						<span :class="$style.rowCheck" aria-hidden="true">
 							<N8nIcon v-if="selectedCredentialIds.includes(cred.id)" icon="check" :size="14" />
@@ -212,11 +249,11 @@ function editCredential(credentialId: string) {
 				</li>
 			</ul>
 			<button
-				v-if="createAuthType"
+				v-if="creatableCredentials[0]"
 				type="button"
 				:class="$style.createRow"
 				data-test-id="tool-credential-picker-create"
-				@click="createCredential('dropdown')"
+				@click="createCredential(creatableCredentials[0].authType, 'dropdown')"
 			>
 				<N8nIcon icon="plus" :size="14" />
 				<span>{{ i18n.baseText('tools.connection.credentialPicker.create') }}</span>
@@ -228,7 +265,7 @@ function editCredential(credentialId: string) {
 		:variant="connectVariant"
 		size="small"
 		data-test-id="tool-credential-picker-trigger-connect"
-		@click="createCredential('direct')"
+		@click="createCredential(creatableCredentials[0]?.authType ?? '', 'direct')"
 	>
 		<span>{{ i18n.baseText('tools.connection.action.connect') }}</span>
 	</N8nButton>
@@ -243,17 +280,36 @@ function editCredential(credentialId: string) {
 .statusPill {
 	display: inline-flex;
 	align-items: center;
-	gap: var(--spacing--3xs);
-	padding: var(--spacing--4xs) var(--spacing--3xs);
-	color: var(--color--text--tint-1);
+	gap: var(--spacing--4xs);
+	min-height: var(--height--xs);
+	padding: var(--spacing--4xs) var(--spacing--2xs);
+	color: var(--text-color--subtle);
 	font-size: var(--font-size--2xs);
 	white-space: nowrap;
+}
+
+.statusMarker {
+	border: var(--border-width) dashed var(--border-color);
+	border-radius: var(--radius--3xs);
 }
 
 .statusPill {
 	background: none;
 	border: 0;
 	cursor: pointer;
+	max-width: 180px;
+}
+
+.disconnectedTrigger {
+	max-width: 180px;
+	white-space: nowrap;
+}
+
+.statusLabel {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 .statusIconConnected,
@@ -308,9 +364,16 @@ function editCredential(credentialId: string) {
 }
 
 .rowLabel {
+	display: flex;
+	flex-direction: column;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+
+.authLabel {
+	color: var(--color--text--tint-1);
+	font-size: var(--font-size--3xs);
 }
 
 .rowActions {

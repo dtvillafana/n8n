@@ -4,6 +4,7 @@ import { mock } from 'vitest-mock-extended';
 
 import type { WorkflowPublishedDataService } from '@/workflows/workflow-published-data.service';
 
+import { WorkflowToolUnavailableError } from '../workflow-tool-unavailable-error';
 import { WorkflowToolWorkflowLoader } from '../workflow-tool-workflow-loader.service';
 
 const reference = { workflowId: 'workflow-1', workflowName: 'Workflow' };
@@ -67,7 +68,9 @@ describe('WorkflowToolWorkflowLoader', () => {
 		const { service, workflowRepository } = makeService();
 		workflowRepository.findOneByAgentToolReference.mockResolvedValue(
 			makeWorkflow({
+				versionId: 'draft-version',
 				activeVersion: {
+					versionId: 'published-version',
 					nodes: [{ id: 'published-node' }],
 					connections: { Published: {} },
 				},
@@ -84,6 +87,7 @@ describe('WorkflowToolWorkflowLoader', () => {
 			{ withActiveVersion: true },
 		);
 		expect(workflow).toMatchObject({
+			versionId: 'published-version',
 			nodes: [{ id: 'published-node' }],
 			connections: { Published: {} },
 		});
@@ -96,21 +100,29 @@ describe('WorkflowToolWorkflowLoader', () => {
 			makeWorkflow({ activeVersion: null } as unknown as Partial<WorkflowEntity>),
 		);
 
-		await expect(
-			service.loadWorkflow('project-1', reference, { usePublishedVersion: true }),
-		).rejects.toThrow(
-			'Workflow "Workflow" is not published. Publish it before using it in a production agent run.',
-		);
+		const error = await service
+			.loadWorkflow('project-1', reference, { usePublishedVersion: true })
+			.catch((e: unknown) => e);
+
+		expect(error).toBeInstanceOf(WorkflowToolUnavailableError);
+		expect(error).toMatchObject({
+			reason: 'not_published',
+			message:
+				'Workflow "Workflow" is not published. Publish it so the published agent can use it.',
+		});
 	});
 
 	it('reads the published version from the publication service when enabled', async () => {
 		const { service, workflowRepository, workflowPublishedDataService } = makeService({
 			useWorkflowPublicationService: true,
 		});
-		workflowRepository.findOneByAgentToolReference.mockResolvedValue(makeWorkflow());
+		workflowRepository.findOneByAgentToolReference.mockResolvedValue(
+			makeWorkflow({ versionId: 'draft-version' }),
+		);
 		workflowPublishedDataService.getPublishedWorkflowData.mockResolvedValue({
 			workflow: makeWorkflow(),
 			publishedVersion: {
+				versionId: 'published-version',
 				nodes: [{ id: 'published-node' }],
 				connections: { Published: {} },
 			},
@@ -123,6 +135,9 @@ describe('WorkflowToolWorkflowLoader', () => {
 		expect(workflowPublishedDataService.getPublishedWorkflowData).toHaveBeenCalledWith(
 			'workflow-1',
 		);
-		expect(workflow).toMatchObject({ nodes: [{ id: 'published-node' }] });
+		expect(workflow).toMatchObject({
+			versionId: 'published-version',
+			nodes: [{ id: 'published-node' }],
+		});
 	});
 });

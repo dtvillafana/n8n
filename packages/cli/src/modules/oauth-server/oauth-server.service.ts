@@ -16,6 +16,7 @@ import type {
 import type { McpClientConnectedPeriod, McpClientTypeFilter } from '@n8n/api-types';
 import { getMcpClientType, MCP_CLIENT_TYPE_FILTER_BUCKETS } from '@n8n/api-types';
 import { Logger } from '@n8n/backend-common';
+import { EventService, UrlService } from '@n8n/backend-services';
 import { GlobalConfig } from '@n8n/config';
 import { INSTANCE_MCP_RESOURCE_ID } from '@n8n/constants';
 import type { User } from '@n8n/db';
@@ -24,10 +25,11 @@ import { hasGlobalScope } from '@n8n/permissions';
 import type { Response } from 'express';
 
 import { AuthService } from '@/auth/auth.service';
-import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
-import { EventService } from '@/events/event.service';
-import { ProtectedResourceRegistry } from '@/services/protected-resource.registry';
-import { UrlService } from '@/services/url.service';
+import { ForbiddenError } from '@n8n/errors';
+import {
+	ProtectedResourceRegistry,
+	type ProtectedResource,
+} from '@/services/protected-resource.registry';
 import { UserManagementMailer } from '@/user-management/email';
 
 import { OAuthClient } from './database/entities/oauth-client.entity';
@@ -162,6 +164,13 @@ export class OAuthServerService implements OAuthServerProvider {
 					return await this.resolveVirtualClient(clientId);
 				}
 
+				// A persisted first-party row is only an FK placeholder (see `resolveVirtualClient`);
+				// the live resource decides, e.g. after a webhook is switched to bearer-only.
+				if (client.isFirstParty) {
+					const resource = await this.resourceRegistry.getByResourceUrl(clientId);
+					if (!resource?.isFirstParty) return undefined;
+				}
+
 				// Some clients echo back the `scope` they saw on registration and
 				// reject responses that include `scope: ''`. Omit the field
 				// entirely when no scopes are advertised.
@@ -257,12 +266,18 @@ export class OAuthServerService implements OAuthServerProvider {
 		// base URL, so a client_id that isn't can never resolve to one. Skip the resolver
 		// sweep + lazy upsert for anything else, so the unauthenticated /authorize path
 		// can't be used to fan out DB lookups on arbitrary client_ids.
-		if (!this.isTriggerResourceClientId(clientId)) {
+		if (clientId.length > MAX_REDIRECT_URI_LENGTH || !this.isTriggerResourceClientId(clientId)) {
 			return undefined;
 		}
 
 		const resource = await this.resourceRegistry.getByResourceUrl(clientId);
 		if (!resource?.isFirstParty) {
+			return undefined;
+		}
+
+		// The lookup ignores the query string, so without this check each `?x=N` variant adds a new row.
+		const resourceUrls = resource.getResourceUrls?.() ?? [resource.getResourceUrl()];
+		if (!resourceUrls.includes(clientId)) {
 			return undefined;
 		}
 
@@ -408,6 +423,22 @@ export class OAuthServerService implements OAuthServerProvider {
 			const targetResource = resource
 				? await this.resourceRegistry.getByResourceUrl(resource)
 				: this.resourceRegistry.getDefaultResource();
+
+			// An unavailable resource is hidden from RFC 9728 discovery, but a client
+			// holding a cached resource URL skips discovery — reject it here so the
+			// flow fails before the user is sent through login and consent.
+			if (targetResource && (await this.isResourceUnavailable(targetResource))) {
+				this.logger.warn('OAuth authorization rejected: target resource is unavailable', {
+					clientId: client.client_id,
+					resource: targetResource.getResourceUrl(),
+				});
+				res.status(400).json({
+					error: 'invalid_target',
+					error_description: 'Resource is not available for authorization',
+				});
+				return;
+			}
+
 			const allowedUris = (await targetResource?.getAllowedRedirectUris?.()) ?? [];
 			if (allowedUris.length > 0 && !this.isRedirectUriAllowed(allowedUris, params.redirectUri)) {
 				this.logger.warn(
@@ -613,6 +644,11 @@ export class OAuthServerService implements OAuthServerProvider {
 		return null;
 	}
 
+	// Resources without `isAvailable` are treated as always available.
+	private async isResourceUnavailable(resource: ProtectedResource): Promise<boolean> {
+		return !((await resource.isAvailable?.()) ?? true);
+	}
+
 	// Exact-match against a registered resource, as required by RFC 8707 §2.1.
 	// Prefix/wildcard matching would open the door to malicious-host or
 	// path-traversal indicators like ".../mcp-server/http/../admin".
@@ -766,8 +802,8 @@ export class OAuthServerService implements OAuthServerProvider {
 	}
 
 	/** Tool names each scope unlocks on this instance, for the clients list UI. */
-	getInstanceScopeTools(): Record<string, string[]> | undefined {
-		return this.resourceRegistry.getDefaultResource()?.getScopeTools?.();
+	async getInstanceScopeTools(): Promise<Record<string, string[]> | undefined> {
+		return await this.resourceRegistry.getDefaultResource()?.getScopeTools?.();
 	}
 
 	/**

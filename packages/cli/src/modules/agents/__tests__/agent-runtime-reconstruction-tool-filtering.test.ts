@@ -1,19 +1,30 @@
 import type * as agents from '@n8n/agents';
 import type { CredentialProvider } from '@n8n/agents';
-import type { AgentJsonConfig, AgentJsonToolConfig } from '@n8n/api-types';
+import {
+	N8N_CHAT_INTEGRATION_TYPE,
+	type AgentJsonConfig,
+	type AgentJsonToolConfig,
+} from '@n8n/api-types';
 import type { Logger } from '@n8n/backend-common';
 import type { CustomFetch, HttpTransport, OutboundHttp } from '@n8n/backend-network';
-import type { CredentialsEntity, User, WorkflowEntity, WorkflowRepository } from '@n8n/db';
+import type {
+	CredentialsEntity,
+	User,
+	UserRepository,
+	WorkflowEntity,
+	WorkflowRepository,
+} from '@n8n/db';
 import { Container } from '@n8n/di';
 import { mock } from 'vitest-mock-extended';
 
 import type { ActiveExecutions } from '@/active-executions';
-import type { CredentialsFinderService } from '@/credentials/credentials-finder.service';
+import type { CredentialsFinderService } from '@n8n/backend-services';
+import { SubworkflowPolicyChecker } from '@/executions/pre-execution-checks';
 import type { EphemeralNodeExecutor } from '@/node-execution';
 import type { OauthService } from '@/oauth/oauth.service';
 import { userHasScopes } from '@/permissions.ee/check-access';
 import type { AiService } from '@/services/ai.service';
-import type { UrlService } from '@/services/url.service';
+import { WorkflowRunner } from '@/workflow-runner';
 import type { WorkflowFinderService } from '@/workflows/workflow-finder.service';
 
 import type { AgentChatAttachmentService } from '../agent-chat-attachment.service';
@@ -22,18 +33,37 @@ import { AgentRuntimeReconstructionService } from '../agent-runtime-reconstructi
 import type { AgentSandboxRuntimeService } from '../agent-sandbox-runtime.service';
 import type { AgentWorkspaceService } from '../agent-workspace.service';
 import type { Agent } from '../entities/agent.entity';
+import { ChatIntegrationRegistry } from '../integrations/agent-chat-integration';
+import { ChatIntegrationActionExecutor } from '../integrations/integration-action-executor';
+import { ChatIntegrationContextQueryExecutor } from '../integrations/integration-context-query-executor';
+import { IntegrationMessageContextService } from '../integrations/integration-message-context.service';
 import type { N8NCheckpointStorage } from '../integrations/n8n-checkpoint-storage';
 import type { N8nMemory } from '../integrations/n8n-memory';
+import { N8nChatIntegration } from '../integrations/platforms/n8n-chat-integration';
 import type * as FromJsonConfig from '../json-config/from-json-config';
-import type { ToolExecutor } from '../json-config/from-json-config';
+import type { BuildFromJsonOptions, ToolExecutor } from '../json-config/from-json-config';
 import type { AgentFileRepository } from '../repositories/agent-file.repository';
 import type { AgentRepository } from '../repositories/agent.repository';
 import type { AgentSecureRuntime } from '../runtime/agent-secure-runtime';
 import { SubAgentRunner } from '../sub-agents/sub-agent-runner';
+import type * as WorkflowToolFactory from '../tools/workflow-tool-factory';
+import { WorkflowToolUnavailableError } from '../tools/workflow-tool-unavailable-error';
+import { WorkflowToolWorkflowLoader } from '../tools/workflow-tool-workflow-loader.service';
 
 vi.mock('@/permissions.ee/check-access', () => ({
 	userHasScopes: vi.fn(),
 }));
+
+const resolveWorkflowToolMock = vi.fn();
+vi.mock('../tools/workflow-tool-factory', async () => {
+	const actual = await vi.importActual<typeof WorkflowToolFactory>(
+		'../tools/workflow-tool-factory',
+	);
+	return {
+		...actual,
+		resolveWorkflowTool: (...args: unknown[]) => resolveWorkflowToolMock(...args),
+	};
+});
 
 const projectId = 'project-1';
 const userId = 'user-1';
@@ -122,7 +152,6 @@ function makeService(overrides: {
 		mock<AgentFileRepository>(),
 		mock<ActiveExecutions>(),
 		workflowRepository,
-		mock<UrlService>(),
 		mock<N8NCheckpointStorage>(),
 		secureRuntime,
 		mock<EphemeralNodeExecutor>(),
@@ -139,7 +168,35 @@ function makeService(overrides: {
 		mock<AgentChatAttachmentService>(),
 	);
 
-	return { service, credentialsFinderService, workflowFinderService, workflowRepository };
+	return {
+		service,
+		credentialsFinderService,
+		workflowFinderService,
+		workflowRepository,
+	};
+}
+
+/** Routes every tool ref through `resolveTool`, as the real `buildFromJson` does. */
+function buildFromJsonResolvingTools(resolved: Array<agents.BuiltTool | null | undefined>) {
+	// The workflow tool context is assembled from the container.
+	Container.set(WorkflowToolWorkflowLoader, mock<WorkflowToolWorkflowLoader>());
+	Container.set(WorkflowRunner, mock<WorkflowRunner>());
+	Container.set(SubworkflowPolicyChecker, mock<SubworkflowPolicyChecker>());
+	buildFromJsonMock.mockImplementationOnce(
+		async (config: AgentJsonConfig, _descriptors: unknown, options: BuildFromJsonOptions) => {
+			for (const ref of config.tools ?? []) resolved.push(await options.resolveTool?.(ref));
+			return builtAgent;
+		},
+	);
+}
+
+function setupN8nChatToolDependencies() {
+	const registry = new ChatIntegrationRegistry();
+	registry.register(new N8nChatIntegration(mock<UserRepository>()));
+	Container.set(ChatIntegrationRegistry, registry);
+	Container.set(IntegrationMessageContextService, mock<IntegrationMessageContextService>());
+	Container.set(ChatIntegrationActionExecutor, mock<ChatIntegrationActionExecutor>());
+	Container.set(ChatIntegrationContextQueryExecutor, mock<ChatIntegrationContextQueryExecutor>());
 }
 
 function toolNamesPassedToBuildFromJson(): string[] {
@@ -170,6 +227,54 @@ describe('AgentRuntimeReconstructionService — per-user tool filtering', () => 
 		expect(userHasScopes).not.toHaveBeenCalled();
 		expect(toolNamesPassedToBuildFromJson()).toEqual(
 			expect.arrayContaining(['Send Slack message', 'Lookup customer', 'custom_tool']),
+		);
+	});
+
+	it('forwards the production n8n Chat marker to workflow tools', async () => {
+		const { service } = makeService({});
+		setupN8nChatToolDependencies();
+		buildFromJsonResolvingTools([]);
+		await service.reconstructFromAgentEntity(
+			makeAgentEntity([workflowTool]),
+			mock<CredentialProvider>(),
+			'production',
+			N8N_CHAT_INTEGRATION_TYPE,
+			undefined,
+			undefined,
+			'manual',
+			undefined,
+			{ attributionUserId: userId },
+		);
+
+		expect(resolveWorkflowToolMock).toHaveBeenCalledWith(
+			workflowTool,
+			expect.objectContaining({
+				integrationType: N8N_CHAT_INTEGRATION_TYPE,
+				userId,
+				publishedN8nChat: true,
+			}),
+		);
+	});
+
+	it('forwards the preview marker to workflow tools', async () => {
+		const { service } = makeService({});
+		setupN8nChatToolDependencies();
+		buildFromJsonResolvingTools([]);
+		await service.reconstructFromAgentEntity(
+			makeAgentEntity([workflowTool]),
+			mock<CredentialProvider>(),
+			'test',
+			N8N_CHAT_INTEGRATION_TYPE,
+			undefined,
+			undefined,
+			'manual',
+			undefined,
+			{ previewChat: true },
+		);
+
+		expect(resolveWorkflowToolMock).toHaveBeenCalledWith(
+			workflowTool,
+			expect.objectContaining({ previewChat: true, publishedN8nChat: false }),
 		);
 	});
 
@@ -215,6 +320,30 @@ describe('AgentRuntimeReconstructionService — per-user tool filtering', () => 
 			['credential:read'],
 		);
 		expect(toolNamesPassedToBuildFromJson()).toEqual(['Get date']);
+	});
+
+	it('skips disabled tools before looking up user access', async () => {
+		vi.mocked(userHasScopes).mockResolvedValue(true);
+		const { service, credentialsFinderService, workflowFinderService, workflowRepository } =
+			makeService({});
+		const entity = makeAgentEntity([
+			{ ...nodeToolWithCredential, enabled: false },
+			{ ...workflowTool, enabled: false },
+			customTool,
+		]);
+
+		await service.reconstructFromAgentEntity(
+			entity,
+			mock<CredentialProvider>(),
+			'test',
+			undefined,
+			testUser,
+		);
+
+		expect(toolNamesPassedToBuildFromJson()).toEqual(['custom_tool']);
+		expect(credentialsFinderService.findCredentialForUser).not.toHaveBeenCalled();
+		expect(workflowFinderService.findWorkflowForUser).not.toHaveBeenCalled();
+		expect(workflowRepository.findOneByAgentToolReference).not.toHaveBeenCalled();
 	});
 
 	it('drops a workflow tool the user cannot access, keeps one they can', async () => {
@@ -315,6 +444,42 @@ describe('AgentRuntimeReconstructionService — per-user tool filtering', () => 
 			credentialIds: ['cred-1'],
 			workflowIds: ['wf-1'],
 		});
+	});
+
+	it('stubs a workflow tool that cannot be built so a call reports the reason', async () => {
+		const { service } = makeService({});
+		resolveWorkflowToolMock.mockRejectedValue(
+			new WorkflowToolUnavailableError('not_found', 'Workflow "Lookup customer" not found'),
+		);
+		const resolved: Array<agents.BuiltTool | null | undefined> = [];
+		buildFromJsonResolvingTools(resolved);
+
+		await service.reconstructFromAgentEntity(
+			makeAgentEntity([workflowTool]),
+			mock<CredentialProvider>(),
+			'production',
+		);
+
+		expect(resolved).toHaveLength(1);
+		expect(resolved[0]?.name).toBe('lookup-customer');
+		// The stub reloads the workflow on call; the container's loader mock finds none.
+		await expect(resolved[0]?.handler?.({}, mock())).rejects.toThrow(
+			'Workflow "Lookup customer" is no longer accessible',
+		);
+	});
+
+	it('still fails the build for any other workflow tool error', async () => {
+		const { service } = makeService({});
+		resolveWorkflowToolMock.mockRejectedValue(new Error('runner unavailable'));
+		buildFromJsonResolvingTools([]);
+
+		await expect(
+			service.reconstructFromAgentEntity(
+				makeAgentEntity([workflowTool]),
+				mock<CredentialProvider>(),
+				'production',
+			),
+		).rejects.toThrow('runner unavailable');
 	});
 });
 

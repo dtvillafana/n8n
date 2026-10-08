@@ -15,12 +15,28 @@ const GITHUB_USER = codespaceEnv('GITHUB_USER');
 const BOX_ID = codespaceEnv('CODESPACE_NAME');
 const ROOT = '/workspaces';
 
-const POLL_INTERVAL_MS = 3000;
+const INITIAL_POLL_INTERVAL_MS = 3000;
+const MAX_POLL_INTERVAL_MS = 30_000;
 const SLACK_UPDATE_INTERVAL_MS = 1500;
 const SLACK_TEXT_LIMIT = 3900;
-const OPENCODE_CONFIG_CONTENT = JSON.stringify({
-	provider: { openrouter: { options: { apiKey: '{env:OPENROUTER_API_KEY}' } } },
-});
+
+export function openCodeConfig(environment) {
+	const config = {
+		provider: { openrouter: { options: { apiKey: '{env:OPENROUTER_API_KEY}' } } },
+	};
+	if (environment.FLAKY_MCP_URL && environment.FLAKY_MCP_TOKEN) {
+		config.mcp = {
+			flaky: {
+				type: 'remote',
+				url: environment.FLAKY_MCP_URL,
+				enabled: true,
+				oauth: false,
+				headers: { Authorization: 'Bearer {env:FLAKY_MCP_TOKEN}' },
+			},
+		};
+	}
+	return config;
+}
 
 function posNum(name, fallback) {
 	const raw = process.env[name];
@@ -29,6 +45,36 @@ function posNum(name, fallback) {
 	if (Number.isFinite(n) && n > 0) return n;
 	console.error(`${name} is not a positive number ("${raw}"); using ${fallback}.`);
 	return fallback;
+}
+
+function nextIdlePollInterval(interval) {
+	return Math.min(interval * 2, MAX_POLL_INTERVAL_MS);
+}
+
+export async function pollOnce(
+	interval,
+	{ dequeueTurn = dequeue, handleTurn = handle, wait = sleep, logError = console.error } = {},
+) {
+	let turn;
+	try {
+		turn = await dequeueTurn();
+	} catch (error) {
+		logError(`poll error: ${error.message}`);
+		await wait(interval);
+		return nextIdlePollInterval(interval);
+	}
+	if (!turn) {
+		await wait(interval);
+		return nextIdlePollInterval(interval);
+	}
+	try {
+		await handleTurn(turn);
+		return INITIAL_POLL_INTERVAL_MS;
+	} catch (error) {
+		logError(`poll error: ${error.message}`);
+		await wait(INITIAL_POLL_INTERVAL_MS);
+		return nextIdlePollInterval(INITIAL_POLL_INTERVAL_MS);
+	}
 }
 
 // This limit expires before n8n's Wait node so that the user receives a specific error.
@@ -43,7 +89,9 @@ export function openCodeEnvironment(environment) {
 	delete childEnvironment.AGENT_WORKER_TOKEN;
 	delete childEnvironment.N8N_DEQUEUE_URL;
 	delete childEnvironment.SLACK_BOT_TOKEN;
-	childEnvironment.OPENCODE_CONFIG_CONTENT = OPENCODE_CONFIG_CONTENT;
+	childEnvironment.OPENCODE_CONFIG_CONTENT = JSON.stringify(openCodeConfig(childEnvironment));
+	childEnvironment.N8N_AGENT_RUNTIME = 'sandbox';
+	childEnvironment.N8N_AGENT_PROFILE = 'slack';
 	return childEnvironment;
 }
 
@@ -51,37 +99,6 @@ export function openCodeEnvironment(environment) {
 const TURN_ENV = openCodeEnvironment(process.env);
 if (BOX_ID) TURN_ENV.CODESPACE_NAME = BOX_ID;
 if (GITHUB_USER) TURN_ENV.GITHUB_USER = GITHUB_USER;
-
-const CODESPACE_DOCS = '.devcontainer/codespaces/README.md';
-
-// The worker has no later turn, so each prompt must define the atomic runtime contract.
-function turnContract(author) {
-	return [
-		'# Your runtime',
-		'You are one turn of a Slack thread, driven by an n8n workflow that runs you as a headless',
-		'OpenCode session on a GitHub codespace. Your final message is the reply that reaches Slack, so keep',
-		'it short and skip heavy markdown.',
-		author ? `You are replying to ${author}.` : '',
-		'',
-		'# A turn is atomic',
-		'The turn ends when you emit your final message, and everything you started ends with it:',
-		'background Bash tasks are killed, Monitor events never arrive, PushNotification has nowhere to',
-		'go, and ScheduleWakeup never fires. You get no turn of your own afterwards — you cannot speak',
-		'again until a human writes again. So run long work (builds, test suites, restarts) in the',
-		'foreground of this turn and wait for it, or do not start it at all. Never end a turn promising',
-		`to verify, check back, or follow up. Work that will not fit the turn limit of ~${Math.round(
-			TURN_TIMEOUT_MS / 60_000,
-		)} minutes`,
-		'should be split: do the part that fits, then say what to ask for next.',
-		'',
-		'# This box',
-		`You are on codespace ${BOX_ID ?? '(unknown)'}, not a laptop. Before you build, start, or expose`,
-		`the app, read ${CODESPACE_DOCS} ("Build and run the app in a session"). It is box-specific and`,
-		'the repo AGENTS.md does not cover it.',
-	]
-		.filter(Boolean)
-		.join('\n');
-}
 
 function safeCwd(cwd) {
 	const safeCwd = resolvePath(typeof cwd === 'string' && cwd ? cwd : `${ROOT}/n8n`);
@@ -104,7 +121,7 @@ function eventError(event) {
 }
 
 export function runOpenCode(
-	{ message, sessionId, cwd, author },
+	{ message, sessionId, cwd },
 	onEvent,
 	onSession,
 	{
@@ -192,9 +209,7 @@ export function runOpenCode(
 			resolve({ result: text.join('\n').trim(), session_id: activeSessionId });
 		});
 
-		child.stdin.end(
-			`${turnContract(typeof author === 'string' ? author : '')}\n\n# Request\n${message}`,
-		);
+		child.stdin.end(message);
 	});
 }
 
@@ -328,6 +343,9 @@ export async function startSlackProgress(
 }
 
 async function handle(turn) {
+	console.log(
+		`${new Date().toISOString()} turn ${turn.turnId} by ${turn.author ?? 'unknown'}: ${turn.sessionId ? 'resume' : 'new'}`,
+	);
 	let result;
 	let activeSessionId = turn.sessionId ?? '';
 	const progress = await startSlackProgress(turn);
@@ -388,22 +406,11 @@ async function main() {
 			'SLACK_BOT_TOKEN is not set. Turns will complete without Slack progress updates.',
 		);
 
-	console.log(`agent-worker polling as ${GITHUB_USER} every ${POLL_INTERVAL_MS}ms`);
-	for (;;) {
-		try {
-			const turn = await dequeue();
-			if (turn) {
-				console.log(
-					`${new Date().toISOString()} turn ${turn.turnId} by ${turn.author ?? 'unknown'}: ${turn.sessionId ? 'resume' : 'new'}`,
-				);
-				await handle(turn);
-				continue;
-			}
-		} catch (error) {
-			console.error(`poll error: ${error.message}`);
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
+	console.log(
+		`agent-worker polling as ${GITHUB_USER} every ${INITIAL_POLL_INTERVAL_MS}-${MAX_POLL_INTERVAL_MS}ms`,
+	);
+	let pollInterval = INITIAL_POLL_INTERVAL_MS;
+	for (;;) pollInterval = await pollOnce(pollInterval);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
