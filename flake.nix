@@ -24,7 +24,7 @@
           pkgs = pkgsFor system;
           inherit (pkgs) lib;
           nodejs = pkgs.nodejs_24;
-          pnpm = pkgs.pnpm_11;
+          pnpm = pkgs.pnpm_12;
           python = pkgs.python3.withPackages (ps: [
             ps.websockets
             ps.urllib3
@@ -32,7 +32,7 @@
           n8n =
             (pkgs.n8n.override {
               inherit nodejs;
-              pnpm_10 = pnpm;
+              pnpm_11 = pnpm;
             }).overrideAttrs
               (
                 finalAttrs: old: {
@@ -59,7 +59,7 @@
                     inherit (finalAttrs) pname version src;
                     inherit pnpm;
                     fetcherVersion = 4;
-                    hash = "sha256-XPVZ3t5Db1RgjcNksuNlvj9Alq2D53Lhi1ZRFsgOLJk=";
+                    hash = "sha256-tgIYe8rFk3wD+lFaBI6mgu8XoJUNCWihewXK2w3eOKc=";
                   };
 
                   nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.pkg-config ];
@@ -83,9 +83,11 @@
 
                     pnpm build --filter=n8n --concurrency=1
 
-                        node .github/scripts/trim-fe-packageJson.js
-                        NODE_ENV=production DOCKER_BUILD=true pnpm --filter=n8n --prod --legacy deploy \
+                        NODE_ENV=production DOCKER_BUILD=true pnpm --filter=n8n --prod \
+                          --config.inject-workspace-packages=true --config.package-import-method=copy deploy \
                           --offline --ignore-scripts --no-optional compiled
+                        rm -f compiled/pnpm-workspace.yaml compiled/pnpm-lock.yaml \
+                          compiled/node_modules/.pnpm-workspace-state-v1.json
 
                         # Compile native modules after deployment so pnpm retains their outputs.
                         pushd compiled/node_modules/sqlite3
