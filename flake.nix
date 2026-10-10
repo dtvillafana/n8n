@@ -95,10 +95,15 @@
                         popd
                         pushd compiled/node_modules/isolated-vm
                         rm -rf prebuilds
+                        # The timer header does not include the definition of uint32_t.
+                        sed -i '1i#include <cstdint>' src/lib/timer.h
                         node-gyp rebuild --release -j "$NIX_BUILD_CORES"
                         popd
                         for kafka in compiled/node_modules/.pnpm/@confluentinc+kafka-javascript@*/node_modules/@confluentinc/kafka-javascript; do
                           pushd "$kafka"
+                          # Use the headers from the Nix librdkafka package.
+                          substituteInPlace binding.gyp \
+                            --replace-fail '/usr/include/librdkafka' '${lib.getDev pkgs.rdkafka}/include/librdkafka'
                           BUILD_LIBRDKAFKA=0 node-gyp rebuild --release
                           popd
                         done
